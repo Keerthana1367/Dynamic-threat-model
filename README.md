@@ -24,15 +24,5 @@ This project is an end-to-end **LLM-driven cybersecurity threat modeling tool** 
 - 📤 **CSV Export**  
   Exports structured attack paths for documentation, analysis, or reporting.
 
----
-
-## 📁 Project Structure
-
-| File / Folder            | Description |
-|--------------------------|-------------|
-| `llm_setup.ipynb`        | One-time setup notebook to connect OpenAI and upload base prompts to MongoDB. |
-| `threat_modeling_ui.py` | Full Gradio app with 3 interactive tabs: Generate, View, and Custom Prompt. |
-| `csv_exports/`           | Contains exported attack paths in CSV format. |
-
 
 
