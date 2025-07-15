@@ -1,28 +1,38 @@
-# Dynamic-threat-model
- AI-Powered Automotive Threat Modeling Tool
+# 🔐 Automotive Threat Modeling with LLM & MongoDB
 
-This project is an end-to-end **LLM-driven cybersecurity threat modeling tool** built for the **automotive domain**. It uses GPT-4 Turbo to dynamically generate attack trees based on vehicle functions, stores them in MongoDB, and allows users to interact with and extend threat models through a user-friendly Gradio UI.
+This project demonstrates a complete workflow for **automotive cybersecurity threat modeling** using a combination of:
 
-🌐 **Live Demo:** [Visit the Render Website](https://your-render-url.com)
+- 📚 A curated dataset of **50 attack surface prompts** (`ATT2.json`)
+- 🤖 An LLM (OpenAI GPT) for generating structured **Mermaid.js attack trees**
+- 🧠 Interactive UI built with **Gradio**
+- 🛢️ Threat trees and prompts stored in **MongoDB**
+- 🌐 Deployed website via **Render**
 
 ---
 
-## 📌 Features
+## Project Structure
 
-- 🧠 **LLM-Powered Threat Tree Generation**  
-  Automatically generate attack trees from label-based or free-form prompts using OpenAI’s GPT-4 Turbo.
+| File/Folder | Description |
+|-------------|-------------|
+| `ATT2.json` | Contains 50 curated threat prompts related to vehicle attack surfaces |
+| `Threat_modelling_6thsem.ipynb` | Jupyter notebook for uploading prompts to MongoDB, testing LLM responses, and visualizing trees |
+| `requirements.txt` | All required Python packages for local or cloud deployment |
+| `.env` | Contains your API keys (not uploaded to GitHub for security) |
+| `README.md` | This file — documentation for the repo |
 
-- 📊 **Structured Path Extraction**  
-  Converts Mermaid.js attack trees into structured paths (vector → technique → method).
+---
 
-- 💾 **MongoDB Integration**  
-  Stores prompt libraries, attack tree structures, and aliases for easy retrieval and update.
+## 🌐 Live Website
 
-- ✍️ **Custom Prompt Extension**  
-  Extends existing trees using natural language and intelligently updates MongoDB entries.
+✅ You can try the deployed app here:  
+**🔗 https://threat-model-3.onrender.com**
 
-- 📤 **CSV Export**  
-  Exports structured attack paths for documentation, analysis, or reporting.
+---
 
+## 🧪 Features
+
+- 🔎 **Tab 1**: Select a threat label and generate the full attack tree using LLM.
+- 📂 **Tab 2**: View saved attack trees from MongoDB and export structured CSV.
+- 🧠 **Tab 3**: Enter free-form prompts to extend or create new threat models.
 
 
