@@ -25,7 +25,7 @@ This project demonstrates a complete workflow for **automotive cybersecurity thr
 ## 🌐 Live Website
 
 ✅ You can try the deployed app here:  
-**🔗https://gradio-threat-modeler.onrender.com**
+**🔗https://threat-model-3.onrender.com**
 
 ---
 
