@@ -3,3 +3,6 @@ gradio
 pymongo
 pandas
 python-dotenv
+fastapi
+uvicorn
+
