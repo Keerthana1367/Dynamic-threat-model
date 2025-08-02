@@ -296,4 +296,5 @@ with gr.Blocks() as demo:
 # 🚀 Launch App (for Render)
 # ========================
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=8080)
+    port = int(os.environ.get("PORT", 8080))  # default 8080 if PORT not set
+    app.run(host="0.0.0.0", port=port)
