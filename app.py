@@ -1,123 +1,110 @@
-import os
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
-from fastapi.middleware.cors import CORSMiddleware
-from nicegui import ui
+import gradio as gr
 from pymongo import MongoClient
+import os
 import openai
-import json
+import pandas as pd
+from datetime import datetime
 
-# 🔐 Setup API Keys and DB
-openai.api_key = os.environ.get("OPENAI_API_KEY") or "your-openai-key"
-mongo_uri = os.environ.get("MONGO_URI") or "your-mongo-uri"
-client = MongoClient(mongo_uri)
-db = client["threatmodeldb"]
-collection = db["attacktrees"]
-prompt_collection = db["prompts"]
+# ========================
+# 🔐 CONFIGURATION
+# ========================
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or "your-openai-key-here"
+MONGO_URI = os.getenv("MONGO_URI") or "mongodb+srv://<username>:<password>@cluster.mongodb.net/"
 
-# 🌐 FastAPI app
-app = FastAPI()
+client = MongoClient(MONGO_URI)
+db = client["ThreatModelDB"]
+prompts_col = db["prompts"]
+trees_col = db["attack_trees"]
 
-# CORS (if needed)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+openai.api_key = OPENAI_API_KEY
 
-# NiceGUI Web Interface
-@ui.page("/")
-async def main_page():
-    ui.label("🔐 AI-Powered Automotive Threat Modeling Tool").classes("text-2xl font-bold")
 
-    with ui.tabs().classes("w-full") as tabs:
-        tab1 = ui.tab("📌 Tab 1: Label to Tree")
-        tab2 = ui.tab("🆕 Tab 2: New Prompt")
-        tab3 = ui.tab("💬 Tab 3: Free Input")
-        tab4 = ui.tab("📚 Tab 4: Full Vectors")
+# ========================
+# 🔁 LLM CALLER
+# ========================
+def query_llm(prompt):
+    response = openai.ChatCompletion.create(
+        model="gpt-4",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.3
+    )
+    return response['choices'][0]['message']['content']
 
-    with ui.tab_panels(tabs, value=tab1).classes("w-full"):
-        with ui.tab_panel(tab1):
-            label = ui.input("Enter label or alias...")
-            output1 = ui.textarea(label="Attack Tree").classes("w-full")
-            ui.button("Generate", on_click=lambda: generate_from_label(label.value, output1))
 
-        with ui.tab_panel(tab2):
-            surface = ui.input("Attack Surface")
-            goal = ui.input("Attack Goal")
-            vector = ui.input("Attack Vector")
-            technique = ui.input("Attack Technique")
-            method = ui.input("Attack Method")
-            output2 = ui.textarea(label="Generated Tree").classes("w-full")
-            ui.button("Generate & Store", on_click=lambda: generate_new_prompt(surface.value, goal.value, vector.value, technique.value, method.value, output2))
+# ========================
+# 📌 TAB 1: Generate From Label or Alias
+# ========================
+def generate_from_label(label):
+    doc = prompts_col.find_one({"$or": [{"label": label}, {"aliases": label}]})
+    if not doc:
+        return f"❌ No matching label or alias found for '{label}'"
+    tree = query_llm(doc['prompt'])
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    trees_col.insert_one({"label": label, "tree": tree, "timestamp": timestamp})
+    return tree
 
-        with ui.tab_panel(tab3):
-            free_prompt = ui.textarea(label="Describe threat or label freely").classes("w-full")
-            output3 = ui.textarea(label="Generated Tree").classes("w-full")
-            ui.button("Interpret & Generate", on_click=lambda: interpret_free_prompt(free_prompt.value, output3))
 
-        with ui.tab_panel(tab4):
-            output4 = ui.textarea(label="All Vectors / Methods").classes("w-full")
-            ui.button("Show All", on_click=lambda: fetch_full_library(output4))
+# ========================
+# 🔁 TAB 2: Retrieve Existing Tree
+# ========================
+def get_tree_from_mongo(label):
+    doc = trees_col.find_one({"label": label}, sort=[("timestamp", -1)])
+    if not doc:
+        return f"❌ No tree found for label '{label}'"
+    return doc['tree']
 
-# 🔧 Tab 1 Logic
-def generate_from_label(label, output_box):
-    prompt_doc = prompt_collection.find_one({"$or": [{"label": label}, {"aliases": label}]})
-    if not prompt_doc:
-        output_box.value = "❌ Label or alias not found."
-        return
-    prompt = prompt_doc["prompt"]
-    result = call_openai(prompt)
-    collection.insert_one({"label": label, "tree": result})
-    output_box.value = result
 
-# 🔧 Tab 2 Logic
-def generate_new_prompt(surface, goal, vector, technique, method, output_box):
-    prompt = f"""Attack Surface: {surface}
-Goal: {goal}
-Vector: {vector}
-Technique: {technique}
-Method: {method}
-Generate a 3-level attack tree in Mermaid.js with AND/OR structure."""
-    result = call_openai(prompt)
-    label = f"{surface} - {goal}"
-    prompt_collection.insert_one({"label": label, "prompt": prompt, "aliases": [surface.lower()]})
-    collection.insert_one({"label": label, "tree": result})
-    output_box.value = result
+# ========================
+# 🆕 TAB 3: Custom Prompt Input (Not Stored)
+# ========================
+def generate_tree_from_free_prompt(prompt):
+    return query_llm(prompt)
 
-# 🔧 Tab 3 Logic
-def interpret_free_prompt(user_input, output_box):
-    doc = prompt_collection.find_one({"$or": [{"label": user_input}, {"aliases": user_input}]})
-    prompt = doc["prompt"] if doc else f"Generate an attack tree for: {user_input}"
-    result = call_openai(prompt)
-    output_box.value = result
 
-# 🔧 Tab 4 Logic
-def fetch_full_library(output_box):
-    docs = list(prompt_collection.find())
-    formatted = "\n".join([f"{d['label']} → {d.get('prompt', '')[:100]}..." for d in docs])
-    output_box.value = formatted or "📂 No records found."
+# ========================
+# 📄 TAB 4: Upload CSV and Generate Summary
+# ========================
+def process_csv(file):
+    df = pd.read_csv(file.name)
+    summary = f"🟢 CSV contains {len(df)} rows and {len(df.columns)} columns:\n\n"
+    summary += "\n".join(f"- {col}" for col in df.columns)
+    return summary
 
-# 🤖 OpenAI Call
-def call_openai(prompt):
-    try:
-        response = openai.ChatCompletion.create(
-            model="gpt-4",
-            messages=[{"role": "system", "content": "You are an automotive cybersecurity expert."},
-                      {"role": "user", "content": prompt}],
-            temperature=0.5,
-            max_tokens=1000
-        )
-        return response["choices"][0]["message"]["content"]
-    except Exception as e:
-        return f"Error: {e}"
 
-# 🟢 Mount NiceGUI to FastAPI
-ui.run_with(app)
+# ========================
+# 🚀 GRADIO UI
+# ========================
+with gr.Blocks() as demo:
+    gr.Markdown("# 🚗 AI Threat Modeling System (Gradio GUI)")
 
-# 🚀 Render Entry Point (PORT fix)
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    ui.run(host="0.0.0.0", port=port)
+    with gr.Tabs():
+        # -----------------------
+        with gr.Tab("📌 Tab 1: From Label/Alias"):
+            label_input = gr.Textbox(label="Enter Label or Alias")
+            output_1 = gr.Textbox(label="Generated Attack Tree")
+            btn_1 = gr.Button("Generate")
+            btn_1.click(fn=generate_from_label, inputs=label_input, outputs=output_1)
 
+        # -----------------------
+        with gr.Tab("📁 Tab 2: Retrieve Stored Tree"):
+            label_retrieve = gr.Textbox(label="Enter Label")
+            output_2 = gr.Textbox(label="Stored Attack Tree")
+            btn_2 = gr.Button("Retrieve")
+            btn_2.click(fn=get_tree_from_mongo, inputs=label_retrieve, outputs=output_2)
+
+        # -----------------------
+        with gr.Tab("✍️ Tab 3: Free-form Prompt"):
+            prompt_input = gr.Textbox(lines=5, label="Enter Custom Prompt")
+            output_3 = gr.Textbox(label="Generated Tree")
+            btn_3 = gr.Button("Generate from Prompt")
+            btn_3.click(fn=generate_tree_from_free_prompt, inputs=prompt_input, outputs=output_3)
+
+        # -----------------------
+        with gr.Tab("📊 Tab 4: Upload CSV"):
+            file_input = gr.File(label="Upload CSV File", file_types=[".csv"])
+            output_4 = gr.Textbox(label="CSV Summary")
+            btn_4 = gr.Button("Analyze CSV")
+            btn_4.click(fn=process_csv, inputs=file_input, outputs=output_4)
+
+# For deployment compatibility
+demo.launch(server_name="0.0.0.0", server_port=int(os.getenv("PORT", 7860)))
