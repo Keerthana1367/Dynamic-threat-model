@@ -1,0 +1,5 @@
+gradio
+openai
+pymongo
+pandas
+PyPDF2
