@@ -1,300 +1,123 @@
 import os
-import openai
-from openai import OpenAI
-import gradio as gr
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
+from nicegui import ui
 from pymongo import MongoClient
-from datetime import datetime
-import re
-import csv
+import openai
 import json
-import pandas as pd
-from collections import defaultdict, deque
-from PyPDF2 import PdfReader
 
-# ========================
-# 🔐 Configurations (Environment Variables)
-# ========================
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-MONGODB_URI = os.getenv("MONGODB_URI")
+# 🔐 Setup API Keys and DB
+openai.api_key = os.environ.get("OPENAI_API_KEY") or "your-openai-key"
+mongo_uri = os.environ.get("MONGO_URI") or "your-mongo-uri"
+client = MongoClient(mongo_uri)
+db = client["threatmodeldb"]
+collection = db["attacktrees"]
+prompt_collection = db["prompts"]
 
-client_ai = OpenAI(api_key=OPENAI_API_KEY)
-mongo_client = MongoClient(MONGODB_URI)
-db = mongo_client["threat_db"]
-attack_tree_collection = db["attack_trees"]
-prompt_library = db["prompt_library"]
+# 🌐 FastAPI app
+app = FastAPI()
 
-EXPORT_DIR = "csv_exports"
-os.makedirs(EXPORT_DIR, exist_ok=True)
+# CORS (if needed)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# ========================
-# 🛠️ Utility Functions
-# ========================
-def parse_mermaid_to_named_edges(mermaid_code):
-    node_labels = {}
-    edges = []
-    lines = mermaid_code.splitlines()
-    for line in lines:
-        node_match = re.findall(r'(\w+)\[(.+?)\]', line)
-        for node_id, label in node_match:
-            node_labels[node_id.strip()] = label.strip()
-    edge_pattern = re.compile(r'(\w+)\s*-->\s*(\w+)')
-    for line in lines:
-        match = edge_pattern.search(line)
-        if match:
-            parent_id = match.group(1).strip()
-            child_id = match.group(2).strip()
-            parent_label = node_labels.get(parent_id, parent_id)
-            child_label = node_labels.get(child_id, child_id)
-            edges.append((parent_label, child_label))
-    return edges
+# NiceGUI Web Interface
+@ui.page("/")
+async def main_page():
+    ui.label("🔐 AI-Powered Automotive Threat Modeling Tool").classes("text-2xl font-bold")
 
-def build_ordered_paths(edges):
-    tree = defaultdict(list)
-    indegree = defaultdict(int)
-    for parent, child in edges:
-        tree[parent].append(child)
-        indegree[child] += 1
-    roots = set(tree.keys()) - set(indegree.keys())
-    if not roots:
-        return []
-    root = list(roots)[0]
-    paths = []
-    queue = deque([(root, [root])])
-    while queue:
-        node, path = queue.popleft()
-        if node not in tree:
-            paths.append(path)
-        else:
-            for child in tree[node]:
-                queue.append((child, path + [child]))
-    return paths
+    with ui.tabs().classes("w-full") as tabs:
+        tab1 = ui.tab("📌 Tab 1: Label to Tree")
+        tab2 = ui.tab("🆕 Tab 2: New Prompt")
+        tab3 = ui.tab("💬 Tab 3: Free Input")
+        tab4 = ui.tab("📚 Tab 4: Full Vectors")
 
-def export_structured_csv(label, paths):
-    safe_label = label[:30].replace(' ', '_').replace('/', '_')
-    filename = f"{safe_label}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
-    filepath = os.path.join(EXPORT_DIR, filename)
-    with open(filepath, mode='w', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        writer.writerow(["Surface Goal", "Attack Vector", "Technique", "Method", "Path"])
-        for path in paths:
-            row = path[:4] + [" > ".join(path)]
-            while len(row) < 5:
-                row.insert(len(row) - 1, "")
-            writer.writerow(row)
-    return filepath
+    with ui.tab_panels(tabs, value=tab1).classes("w-full"):
+        with ui.tab_panel(tab1):
+            label = ui.input("Enter label or alias...")
+            output1 = ui.textarea(label="Attack Tree").classes("w-full")
+            ui.button("Generate", on_click=lambda: generate_from_label(label.value, output1))
 
-def read_csv_as_dataframe(filepath):
+        with ui.tab_panel(tab2):
+            surface = ui.input("Attack Surface")
+            goal = ui.input("Attack Goal")
+            vector = ui.input("Attack Vector")
+            technique = ui.input("Attack Technique")
+            method = ui.input("Attack Method")
+            output2 = ui.textarea(label="Generated Tree").classes("w-full")
+            ui.button("Generate & Store", on_click=lambda: generate_new_prompt(surface.value, goal.value, vector.value, technique.value, method.value, output2))
+
+        with ui.tab_panel(tab3):
+            free_prompt = ui.textarea(label="Describe threat or label freely").classes("w-full")
+            output3 = ui.textarea(label="Generated Tree").classes("w-full")
+            ui.button("Interpret & Generate", on_click=lambda: interpret_free_prompt(free_prompt.value, output3))
+
+        with ui.tab_panel(tab4):
+            output4 = ui.textarea(label="All Vectors / Methods").classes("w-full")
+            ui.button("Show All", on_click=lambda: fetch_full_library(output4))
+
+# 🔧 Tab 1 Logic
+def generate_from_label(label, output_box):
+    prompt_doc = prompt_collection.find_one({"$or": [{"label": label}, {"aliases": label}]})
+    if not prompt_doc:
+        output_box.value = "❌ Label or alias not found."
+        return
+    prompt = prompt_doc["prompt"]
+    result = call_openai(prompt)
+    collection.insert_one({"label": label, "tree": result})
+    output_box.value = result
+
+# 🔧 Tab 2 Logic
+def generate_new_prompt(surface, goal, vector, technique, method, output_box):
+    prompt = f"""Attack Surface: {surface}
+Goal: {goal}
+Vector: {vector}
+Technique: {technique}
+Method: {method}
+Generate a 3-level attack tree in Mermaid.js with AND/OR structure."""
+    result = call_openai(prompt)
+    label = f"{surface} - {goal}"
+    prompt_collection.insert_one({"label": label, "prompt": prompt, "aliases": [surface.lower()]})
+    collection.insert_one({"label": label, "tree": result})
+    output_box.value = result
+
+# 🔧 Tab 3 Logic
+def interpret_free_prompt(user_input, output_box):
+    doc = prompt_collection.find_one({"$or": [{"label": user_input}, {"aliases": user_input}]})
+    prompt = doc["prompt"] if doc else f"Generate an attack tree for: {user_input}"
+    result = call_openai(prompt)
+    output_box.value = result
+
+# 🔧 Tab 4 Logic
+def fetch_full_library(output_box):
+    docs = list(prompt_collection.find())
+    formatted = "\n".join([f"{d['label']} → {d.get('prompt', '')[:100]}..." for d in docs])
+    output_box.value = formatted or "📂 No records found."
+
+# 🤖 OpenAI Call
+def call_openai(prompt):
     try:
-        df = pd.read_csv(filepath)
-        df.drop_duplicates(subset=["Path"], inplace=True)
-        return df
-    except Exception:
-        return pd.DataFrame(columns=["Surface Goal", "Attack Vector", "Technique", "Method", "Path"])
-
-# ========================
-# Tab 1: Generate from label
-# ========================
-def generate_attack_tree_from_label(label_selected):
-    if not label_selected:
-        return "❌ Select a threat scenario."
-    doc = prompt_library.find_one({"label": label_selected}) or prompt_library.find_one({"aliases": {"$in": [label_selected.lower()]}})
-    if not doc or "prompt" not in doc:
-        return f"❌ No prompt or alias found for '{label_selected}'"
-    matched_prompt = doc["prompt"]
-    label_to_save = doc["label"]
-    try:
-        system_message = {
-            "role": "system",
-            "content": "You are a cybersecurity expert. Return only the attack tree in Mermaid format using:\n```mermaid\ngraph TD\n...```"
-        }
-        response = client_ai.chat.completions.create(
-            model="gpt-4-turbo",
-            messages=[system_message, {"role": "user", "content": matched_prompt}],
-            temperature=0.3,
-            max_tokens=1500
+        response = openai.ChatCompletion.create(
+            model="gpt-4",
+            messages=[{"role": "system", "content": "You are an automotive cybersecurity expert."},
+                      {"role": "user", "content": prompt}],
+            temperature=0.5,
+            max_tokens=1000
         )
-        raw = response.choices[0].message.content.strip()
-        match = re.search(r"```mermaid\s*(graph TD[\s\S]*?)```", raw)
-        if not match:
-            return "❌ Mermaid diagram not found or invalid format."
-        mermaid_code = match.group(1).strip()
-        attack_tree_collection.update_one(
-            {"label": label_to_save},
-            {"$set": {
-                "prompt": matched_prompt,
-                "mermaid_code": mermaid_code,
-                "updated_at": datetime.utcnow()
-            }},
-            upsert=True
-        )
-        return f"```mermaid\n{mermaid_code}\n```"
+        return response["choices"][0]["message"]["content"]
     except Exception as e:
-        return f"❌ Error: {str(e)}"
+        return f"Error: {e}"
 
-# ========================
-# Tab 2: View Stored Trees
-# ========================
-def wrapper_load(label):
-    if not label:
-        return "❌ Select a saved attack tree.", pd.DataFrame(), None
-    doc = attack_tree_collection.find_one({"label": label}) or prompt_library.find_one({"aliases": {"$in": [label.lower()]}})
-    if doc and "label" in doc and "mermaid_code" not in doc:
-        return generate_attack_tree_from_label(doc["label"]), pd.DataFrame(), None
-    if not doc or "mermaid_code" not in doc:
-        return "❌ No stored attack tree found.", pd.DataFrame(), None
-    mermaid_code = doc["mermaid_code"]
-    edges = parse_mermaid_to_named_edges(mermaid_code)
-    paths = build_ordered_paths(edges)
-    csv_path = export_structured_csv(doc["label"], paths)
-    df = read_csv_as_dataframe(csv_path)
-    return f"```mermaid\n{mermaid_code}\n```", df, csv_path
+# 🟢 Mount NiceGUI to FastAPI
+ui.run_with(app)
 
-# ========================
-# Tab 3: Free Prompt
-# ========================
-def generate_tree_from_free_prompt(prompt):
-    if not prompt.strip():
-        return "❌ Please enter a valid prompt"
-    try:
-        base_prompt = prompt
-        system_msg = {
-            "role": "system",
-            "content": "You are a cybersecurity expert. Return the full updated attack tree in Mermaid format:\n```mermaid\ngraph TD\n...```"
-        }
-        response = client_ai.chat.completions.create(
-            model="gpt-4-turbo",
-            messages=[system_msg, {"role": "user", "content": base_prompt}],
-            temperature=0.3,
-            max_tokens=1500
-        )
-        raw = response.choices[0].message.content.strip()
-        match = re.search(r"```mermaid\s*(graph TD[\s\S]*?)```", raw)
-        if not match:
-            return "❌ Mermaid diagram not found or invalid format."
-        mermaid_code = match.group(1).strip()
-        return f"```mermaid\n{mermaid_code}\n```"
-    except Exception as e:
-        return f"❌ Error: {str(e)}"
-
-# ========================
-# Tab 4: Upload & Analyze File + Ask Questions
-# ========================
-def extract_text_from_pdf(file):
-    try:
-        reader = PdfReader(file)
-        return "".join([page.extract_text() or "" for page in reader.pages])
-    except:
-        return ""
-
-def read_file_content(file):
-    ext = file.name.split('.')[-1].lower()
-    if ext == "pdf":
-        return extract_text_from_pdf(file)
-    elif ext == "csv":
-        df = pd.read_csv(file)
-        return df.to_string(index=False)
-    elif ext == "json":
-        content = json.load(file)
-        return json.dumps(content, indent=2)
-    return ""
-
-def process_uploaded_file(file):
-    try:
-        content = read_file_content(file)
-        if not content:
-            return "❌ Could not extract content."
-        prompt = f"""Analyze the following content. If it includes prompts, generate attack trees using Mermaid.
-If it includes Mermaid attack tree code, explain the tree, recommend improvements, and suggest mitigations.
-
-Content:
-{content}
-"""
-        system_msg = {
-            "role": "system",
-            "content": "You're a cybersecurity expert. If input is a prompt, return attack tree in Mermaid. If it's a tree, explain + mitigate."
-        }
-        response = client_ai.chat.completions.create(
-            model="gpt-4-turbo",
-            messages=[system_msg, {"role": "user", "content": prompt}],
-            temperature=0.3,
-            max_tokens=1600
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        return f"❌ Error: {str(e)}"
-
-def ask_question_about_file(file, question):
-    try:
-        content = read_file_content(file)
-        if not content:
-            return "❌ Could not extract file content."
-        prompt = f"""Here is the content from a file:
-{content[:3000]}
-
-Now answer this question: {question}"""
-        response = client_ai.chat.completions.create(
-            model="gpt-4-turbo",
-            messages=[
-                {"role": "system", "content": "You are a cybersecurity assistant helping users understand and analyze file content."},
-                {"role": "user", "content": prompt}
-            ]
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        return f"❌ Error: {str(e)}"
-
-# ========================
-# Dropdowns
-# ========================
-def get_all_labels():
-    return sorted([doc["label"] for doc in prompt_library.find({}, {"label": 1})])
-
-def get_stored_labels():
-    return sorted(set([doc["label"] for doc in attack_tree_collection.find({"label": {"$exists": True}})]))
-
-def refresh_dropdowns():
-    return gr.update(choices=get_all_labels()), gr.update(choices=get_stored_labels())
-
-# ========================
-# Gradio UI
-# ========================
-with gr.Blocks() as demo:
-    with gr.Tab("🫠 Generate Attack Tree"):
-        label_dropdown = gr.Dropdown(choices=[], label="📌 Select or Type", interactive=True, allow_custom_value=True)
-        generate_button = gr.Button("🚀 Generate Attack Tree")
-        mermaid_display = gr.Markdown()
-        generate_button.click(fn=generate_attack_tree_from_label, inputs=label_dropdown, outputs=mermaid_display)
-
-    with gr.Tab("📂 Library"):
-        saved_dropdown = gr.Dropdown(choices=[], label="📌 Select Stored Tree", interactive=True, allow_custom_value=True)
-        mermaid_output = gr.Markdown()
-        relation_table = gr.Dataframe(headers=["Surface Goal", "Attack Vector", "Technique", "Method", "Path"], datatype=["str"]*5, interactive=False)
-        download_button = gr.File()
-        regen_button = gr.Button("🔄 Regenerate Tree")
-        saved_dropdown.change(fn=wrapper_load, inputs=saved_dropdown, outputs=[mermaid_output, relation_table, download_button])
-        regen_button.click(fn=generate_attack_tree_from_label, inputs=saved_dropdown, outputs=mermaid_output)
-
-    with gr.Tab("🗓️ Custom Prompt"):
-        prompt_input = gr.Textbox(label="Enter Custom Prompt", lines=5)
-        custom_mermaid_output = gr.Markdown()
-        submit_button = gr.Button("Generate Tree")
-        submit_button.click(fn=generate_tree_from_free_prompt, inputs=prompt_input, outputs=custom_mermaid_output)
-
-    with gr.Tab("📄 Upload File"):
-        file_input = gr.File(file_types=[".pdf", ".csv", ".json"], label="Upload Prompt or Tree File")
-        file_output = gr.Markdown()
-        question_box = gr.Textbox(label="Ask a question about the file")
-        answer_box = gr.Markdown()
-        process_button = gr.Button("📈 Process File")
-        ask_button = gr.Button("🤔 Ask Question")
-        process_button.click(fn=process_uploaded_file, inputs=file_input, outputs=file_output)
-        ask_button.click(fn=ask_question_about_file, inputs=[file_input, question_box], outputs=answer_box)
-
-    demo.load(fn=refresh_dropdowns, inputs=[], outputs=[label_dropdown, saved_dropdown])
-
-# ========================
-# 🚀 Launch App (for Render)
-# ========================
+# 🚀 Render Entry Point (PORT fix)
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))  # default 8080 if PORT not set
-    app.run(host="0.0.0.0", port=port)
+    port = int(os.environ.get("PORT", 8080))
+    ui.run(host="0.0.0.0", port=port)
+
