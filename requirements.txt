@@ -3,3 +3,5 @@ openai
 pymongo
 pandas
 PyPDF2
+fastapi
+uvicorn
