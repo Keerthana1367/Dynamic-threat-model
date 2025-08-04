@@ -15,8 +15,15 @@ import pandas as pd
 from collections import defaultdict, deque
 
 # ========== Config ==========
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or "sk-proj-..."  # Replace with your secure key
-MONGODB_URI = os.getenv("MONGO_URI") or "mongodb+srv://..."     # Replace with your secure URI
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+MONGODB_URI = os.getenv("MONGO_URI")
+
+# Validate environment variables
+if not OPENAI_API_KEY:
+    raise ValueError("❌ OPENAI_API_KEY is not set.")
+if not MONGODB_URI or "@" not in MONGODB_URI:
+    raise ValueError("❌ MONGO_URI is not set or malformed. Check Render environment variables.")
 
 client_ai = OpenAI(api_key=OPENAI_API_KEY)
 mongo_client = MongoClient(MONGODB_URI)
@@ -27,6 +34,7 @@ EXPORT_DIR = "csv_exports"
 os.makedirs(EXPORT_DIR, exist_ok=True)
 
 # ========== Utility ==========
+
 def parse_mermaid_to_named_edges(mermaid_code):
     node_labels = {}
     edges = []
@@ -105,9 +113,9 @@ def generate_attack_tree(label_or_prompt: str):
         return None, str(e)
 
 # ========== FastAPI App ==========
+
 app = FastAPI(title="Threat Modeling API")
 
-# Allow CORS if used from frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
@@ -127,6 +135,7 @@ async def generate_tree_endpoint(request: Request):
     return {"label": label_or_prompt, "mermaid": mermaid_code}
 
 # ========== Gradio UI ==========
+
 def gradio_generate(label):
     code, err = generate_attack_tree(label)
     return f"```mermaid\n{code}\n```" if code else f"❌ {err}"
@@ -148,6 +157,5 @@ def launch_gradio():
     return demo.launch(share=True, inline=True, prevent_thread_lock=True)
 
 # ========== Run ==========
-
 if __name__ == "__main__":
     uvicorn.run("app:app", host="0.0.0.0", port=7860, reload=True)
