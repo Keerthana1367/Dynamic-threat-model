@@ -1,110 +1,153 @@
+# app.py
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 import gradio as gr
-from pymongo import MongoClient
+import uvicorn
 import os
-import openai
-import pandas as pd
 from datetime import datetime
+from pymongo import MongoClient
+from openai import OpenAI
+import re
+import csv
+import pandas as pd
+from collections import defaultdict, deque
 
-# ========================
-# 🔐 CONFIGURATION
-# ========================
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or "your-openai-key-here"
-MONGO_URI = os.getenv("MONGO_URI") or "mongodb+srv://<username>:<password>@cluster.mongodb.net/"
+# ========== Config ==========
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or "sk-proj-..."  # Replace with your secure key
+MONGODB_URI = os.getenv("MONGO_URI") or "mongodb+srv://..."     # Replace with your secure URI
 
-client = MongoClient(MONGO_URI)
-db = client["ThreatModelDB"]
-prompts_col = db["prompts"]
-trees_col = db["attack_trees"]
+client_ai = OpenAI(api_key=OPENAI_API_KEY)
+mongo_client = MongoClient(MONGODB_URI)
+db = mongo_client["threat_db"]
+attack_tree_collection = db["attack_trees"]
+prompt_library = db["prompt_library"]
+EXPORT_DIR = "csv_exports"
+os.makedirs(EXPORT_DIR, exist_ok=True)
 
-openai.api_key = OPENAI_API_KEY
+# ========== Utility ==========
+def parse_mermaid_to_named_edges(mermaid_code):
+    node_labels = {}
+    edges = []
+    lines = mermaid_code.splitlines()
+    for line in lines:
+        node_match = re.findall(r'(\w+)\[(.+?)\]', line)
+        for node_id, label in node_match:
+            node_labels[node_id.strip()] = label.strip()
+    edge_pattern = re.compile(r'(\w+)\s*-->\s*(\w+)')
+    for line in lines:
+        match = edge_pattern.search(line)
+        if match:
+            parent_id = match.group(1).strip()
+            child_id = match.group(2).strip()
+            parent_label = node_labels.get(parent_id, parent_id)
+            child_label = node_labels.get(child_id, child_id)
+            edges.append((parent_label, child_label))
+    return edges
 
+def build_ordered_paths(edges):
+    tree = defaultdict(list)
+    indegree = defaultdict(int)
+    for parent, child in edges:
+        tree[parent].append(child)
+        indegree[child] += 1
+    roots = set(tree.keys()) - set(indegree.keys())
+    if not roots:
+        return []
+    root = list(roots)[0]
+    paths = []
+    queue = deque([(root, [root])])
+    while queue:
+        node, path = queue.popleft()
+        if node not in tree:
+            paths.append(path)
+        else:
+            for child in tree[node]:
+                queue.append((child, path + [child]))
+    return paths
 
-# ========================
-# 🔁 LLM CALLER
-# ========================
-def query_llm(prompt):
-    response = openai.ChatCompletion.create(
-        model="gpt-4",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.3
-    )
-    return response['choices'][0]['message']['content']
+def generate_attack_tree(label_or_prompt: str):
+    doc = prompt_library.find_one({"label": label_or_prompt}) or \
+          prompt_library.find_one({"aliases": {"$in": [label_or_prompt.lower()]}})
 
+    if doc and "prompt" in doc:
+        prompt = doc["prompt"]
+        label = doc["label"]
+    else:
+        prompt = label_or_prompt
+        label = "custom_" + datetime.utcnow().strftime("%Y%m%d_%H%M%S")
 
-# ========================
-# 📌 TAB 1: Generate From Label or Alias
-# ========================
-def generate_from_label(label):
-    doc = prompts_col.find_one({"$or": [{"label": label}, {"aliases": label}]})
-    if not doc:
-        return f"❌ No matching label or alias found for '{label}'"
-    tree = query_llm(doc['prompt'])
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    trees_col.insert_one({"label": label, "tree": tree, "timestamp": timestamp})
-    return tree
+    try:
+        system_message = {
+            "role": "system",
+            "content": "You are a cybersecurity expert. Return only the attack tree in Mermaid format using:\n```mermaid\ngraph TD\n...```"
+        }
+        response = client_ai.chat.completions.create(
+            model="gpt-4-turbo",
+            messages=[system_message, {"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=1500
+        )
+        raw = response.choices[0].message.content.strip()
+        match = re.search(r"```mermaid\s*(graph TD[\s\S]*?)```", raw)
+        if not match:
+            return None, "❌ Mermaid diagram not found."
 
+        mermaid_code = match.group(1).strip()
+        attack_tree_collection.update_one(
+            {"label": label},
+            {"$set": {"prompt": prompt, "mermaid_code": mermaid_code, "updated_at": datetime.utcnow()}},
+            upsert=True
+        )
+        return mermaid_code, None
+    except Exception as e:
+        return None, str(e)
 
-# ========================
-# 🔁 TAB 2: Retrieve Existing Tree
-# ========================
-def get_tree_from_mongo(label):
-    doc = trees_col.find_one({"label": label}, sort=[("timestamp", -1)])
-    if not doc:
-        return f"❌ No tree found for label '{label}'"
-    return doc['tree']
+# ========== FastAPI App ==========
+app = FastAPI(title="Threat Modeling API")
 
+# Allow CORS if used from frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
+)
 
-# ========================
-# 🆕 TAB 3: Custom Prompt Input (Not Stored)
-# ========================
-def generate_tree_from_free_prompt(prompt):
-    return query_llm(prompt)
+@app.post("/generate-tree")
+async def generate_tree_endpoint(request: Request):
+    data = await request.json()
+    label_or_prompt = data.get("input", "").strip()
+    if not label_or_prompt:
+        return JSONResponse(content={"error": "Prompt or label is required."}, status_code=400)
 
+    mermaid_code, error = generate_attack_tree(label_or_prompt)
+    if error:
+        return JSONResponse(content={"error": error}, status_code=500)
+    return {"label": label_or_prompt, "mermaid": mermaid_code}
 
-# ========================
-# 📄 TAB 4: Upload CSV and Generate Summary
-# ========================
-def process_csv(file):
-    df = pd.read_csv(file.name)
-    summary = f"🟢 CSV contains {len(df)} rows and {len(df.columns)} columns:\n\n"
-    summary += "\n".join(f"- {col}" for col in df.columns)
-    return summary
+# ========== Gradio UI ==========
+def gradio_generate(label):
+    code, err = generate_attack_tree(label)
+    return f"```mermaid\n{code}\n```" if code else f"❌ {err}"
 
-
-# ========================
-# 🚀 GRADIO UI
-# ========================
 with gr.Blocks() as demo:
-    gr.Markdown("# 🚗 AI Threat Modeling System (Gradio GUI)")
+    with gr.Tab("🌐 Web Interface"):
+        gr.Markdown("## 🔐 Threat Tree Generator")
+        label_input = gr.Textbox(label="Prompt or Label")
+        output = gr.Markdown()
+        gen_btn = gr.Button("🚀 Generate")
+        gen_btn.click(fn=gradio_generate, inputs=label_input, outputs=output)
 
-    with gr.Tabs():
-        # -----------------------
-        with gr.Tab("📌 Tab 1: From Label/Alias"):
-            label_input = gr.Textbox(label="Enter Label or Alias")
-            output_1 = gr.Textbox(label="Generated Attack Tree")
-            btn_1 = gr.Button("Generate")
-            btn_1.click(fn=generate_from_label, inputs=label_input, outputs=output_1)
+@app.get("/")
+def root():
+    return {"message": "Threat Modeling API is running."}
 
-        # -----------------------
-        with gr.Tab("📁 Tab 2: Retrieve Stored Tree"):
-            label_retrieve = gr.Textbox(label="Enter Label")
-            output_2 = gr.Textbox(label="Stored Attack Tree")
-            btn_2 = gr.Button("Retrieve")
-            btn_2.click(fn=get_tree_from_mongo, inputs=label_retrieve, outputs=output_2)
+@app.get("/gradio")
+def launch_gradio():
+    return demo.launch(share=True, inline=True, prevent_thread_lock=True)
 
-        # -----------------------
-        with gr.Tab("✍️ Tab 3: Free-form Prompt"):
-            prompt_input = gr.Textbox(lines=5, label="Enter Custom Prompt")
-            output_3 = gr.Textbox(label="Generated Tree")
-            btn_3 = gr.Button("Generate from Prompt")
-            btn_3.click(fn=generate_tree_from_free_prompt, inputs=prompt_input, outputs=output_3)
+# ========== Run ==========
 
-        # -----------------------
-        with gr.Tab("📊 Tab 4: Upload CSV"):
-            file_input = gr.File(label="Upload CSV File", file_types=[".csv"])
-            output_4 = gr.Textbox(label="CSV Summary")
-            btn_4 = gr.Button("Analyze CSV")
-            btn_4.click(fn=process_csv, inputs=file_input, outputs=output_4)
-
-# For deployment compatibility
-demo.launch(server_name="0.0.0.0", server_port=int(os.getenv("PORT", 7860)))
+if __name__ == "__main__":
+    uvicorn.run("app:app", host="0.0.0.0", port=7860, reload=True)
