@@ -1,39 +1,62 @@
 # app.py
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from gradio.routes import mount_gradio_app
 import gradio as gr
-import uvicorn
-import os
-from datetime import datetime
-from pymongo import MongoClient
+import openai
 from openai import OpenAI
+from pymongo import MongoClient
+from datetime import datetime
 import re
 import csv
+import os
+import json
 import pandas as pd
 from collections import defaultdict, deque
+from PyPDF2 import PdfReader
 
-# ========== Config ==========
-
+# ========================
+# 🔐 CONFIGURATION
+# ========================
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-MONGODB_URI = os.getenv("MONGO_URI")
-
-# Validate environment variables
-if not OPENAI_API_KEY:
-    raise ValueError("❌ OPENAI_API_KEY is not set.")
-if not MONGODB_URI or "@" not in MONGODB_URI:
-    raise ValueError("❌ MONGO_URI is not set or malformed. Check Render environment variables.")
+MONGODB_URI = os.getenv("MONGODB_URI")
 
 client_ai = OpenAI(api_key=OPENAI_API_KEY)
 mongo_client = MongoClient(MONGODB_URI)
 db = mongo_client["threat_db"]
 attack_tree_collection = db["attack_trees"]
 prompt_library = db["prompt_library"]
+
 EXPORT_DIR = "csv_exports"
 os.makedirs(EXPORT_DIR, exist_ok=True)
 
-# ========== Utility ==========
+# ========================
+# ⚙️ FASTAPI SETUP
+# ========================
+app = FastAPI()
+
+# Allow all CORS (optional, based on your use case)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ========================
+# 🌐 WEBHOOK ENDPOINT
+# ========================
+@app.post("/webhook")
+async def receive_webhook(request: Request):
+    payload = await request.json()
+    print("📥 Webhook Received:", payload)
+    # 🔧 Optional: save to MongoDB or handle the payload
+    return {"status": "✅ Webhook received", "received_data": payload}
+
+# ========================
+# 🛠️ Utility Functions
+# ========================
 
 def parse_mermaid_to_named_edges(mermaid_code):
     node_labels = {}
@@ -75,17 +98,39 @@ def build_ordered_paths(edges):
                 queue.append((child, path + [child]))
     return paths
 
-def generate_attack_tree(label_or_prompt: str):
-    doc = prompt_library.find_one({"label": label_or_prompt}) or \
-          prompt_library.find_one({"aliases": {"$in": [label_or_prompt.lower()]}})
+def export_structured_csv(label, paths):
+    safe_label = label[:30].replace(' ', '_').replace('/', '_')
+    filename = f"{safe_label}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
+    filepath = os.path.join(EXPORT_DIR, filename)
+    with open(filepath, mode='w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(["Surface Goal", "Attack Vector", "Technique", "Method", "Path"])
+        for path in paths:
+            row = path[:4] + [" > ".join(path)]
+            while len(row) < 5:
+                row.insert(len(row) - 1, "")
+            writer.writerow(row)
+    return filepath
 
-    if doc and "prompt" in doc:
-        prompt = doc["prompt"]
-        label = doc["label"]
-    else:
-        prompt = label_or_prompt
-        label = "custom_" + datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+def read_csv_as_dataframe(filepath):
+    try:
+        df = pd.read_csv(filepath)
+        df.drop_duplicates(subset=["Path"], inplace=True)
+        return df
+    except Exception:
+        return pd.DataFrame(columns=["Surface Goal", "Attack Vector", "Technique", "Method", "Path"])
 
+# ========================
+# Tab 1: Generate from label
+# ========================
+def generate_attack_tree_from_label(label_selected):
+    if not label_selected:
+        return "❌ Select a threat scenario."
+    doc = prompt_library.find_one({"label": label_selected}) or prompt_library.find_one({"aliases": {"$in": [label_selected.lower()]}})
+    if not doc or "prompt" not in doc:
+        return f"❌ No prompt or alias found for '{label_selected}'"
+    matched_prompt = doc["prompt"]
+    label_to_save = doc["label"]
     try:
         system_message = {
             "role": "system",
@@ -93,69 +138,189 @@ def generate_attack_tree(label_or_prompt: str):
         }
         response = client_ai.chat.completions.create(
             model="gpt-4-turbo",
-            messages=[system_message, {"role": "user", "content": prompt}],
+            messages=[system_message, {"role": "user", "content": matched_prompt}],
             temperature=0.3,
             max_tokens=1500
         )
         raw = response.choices[0].message.content.strip()
         match = re.search(r"```mermaid\s*(graph TD[\s\S]*?)```", raw)
         if not match:
-            return None, "❌ Mermaid diagram not found."
-
+            return "❌ Mermaid diagram not found or invalid format."
         mermaid_code = match.group(1).strip()
         attack_tree_collection.update_one(
-            {"label": label},
-            {"$set": {"prompt": prompt, "mermaid_code": mermaid_code, "updated_at": datetime.utcnow()}},
+            {"label": label_to_save},
+            {"$set": {
+                "prompt": matched_prompt,
+                "mermaid_code": mermaid_code,
+                "updated_at": datetime.utcnow()
+            }},
             upsert=True
         )
-        return mermaid_code, None
+        return f"```mermaid\n{mermaid_code}\n```"
     except Exception as e:
-        return None, str(e)
+        return f"❌ Error: {str(e)}"
 
-# ========== FastAPI App ==========
+# ========================
+# Tab 2: View Stored Trees
+# ========================
+def wrapper_load(label):
+    if not label:
+        return "❌ Select a saved attack tree.", pd.DataFrame(), None
+    doc = attack_tree_collection.find_one({"label": label}) or prompt_library.find_one({"aliases": {"$in": [label.lower()]}})
+    if doc and "label" in doc and "mermaid_code" not in doc:
+        return generate_attack_tree_from_label(doc["label"]), pd.DataFrame(), None
+    if not doc or "mermaid_code" not in doc:
+        return "❌ No stored attack tree found.", pd.DataFrame(), None
+    mermaid_code = doc["mermaid_code"]
+    edges = parse_mermaid_to_named_edges(mermaid_code)
+    paths = build_ordered_paths(edges)
+    csv_path = export_structured_csv(doc["label"], paths)
+    df = read_csv_as_dataframe(csv_path)
+    return f"```mermaid\n{mermaid_code}\n```", df, csv_path
 
-app = FastAPI(title="Threat Modeling API")
+# ========================
+# Tab 3: Free Prompt
+# ========================
+def generate_tree_from_free_prompt(prompt):
+    if not prompt.strip():
+        return "❌ Please enter a valid prompt"
+    try:
+        base_prompt = prompt
+        system_msg = {
+            "role": "system",
+            "content": "You are a cybersecurity expert. Return the full updated attack tree in Mermaid format:\n```mermaid\ngraph TD\n...```"
+        }
+        response = client_ai.chat.completions.create(
+            model="gpt-4-turbo",
+            messages=[system_msg, {"role": "user", "content": base_prompt}],
+            temperature=0.3,
+            max_tokens=1500
+        )
+        raw = response.choices[0].message.content.strip()
+        match = re.search(r"```mermaid\s*(graph TD[\s\S]*?)```", raw)
+        if not match:
+            return "❌ Mermaid diagram not found or invalid format."
+        mermaid_code = match.group(1).strip()
+        return f"```mermaid\n{mermaid_code}\n```"
+    except Exception as e:
+        return f"❌ Error: {str(e)}"
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
-)
+# ========================
+# Tab 4: Upload & Analyze
+# ========================
+def extract_text_from_pdf(file):
+    try:
+        reader = PdfReader(file)
+        return "".join([page.extract_text() or "" for page in reader.pages])
+    except:
+        return ""
 
-@app.post("/generate-tree")
-async def generate_tree_endpoint(request: Request):
-    data = await request.json()
-    label_or_prompt = data.get("input", "").strip()
-    if not label_or_prompt:
-        return JSONResponse(content={"error": "Prompt or label is required."}, status_code=400)
+def read_file_content(file):
+    ext = file.name.split('.')[-1].lower()
+    if ext == "pdf":
+        return extract_text_from_pdf(file)
+    elif ext == "csv":
+        df = pd.read_csv(file)
+        return df.to_string(index=False)
+    elif ext == "json":
+        content = json.load(file)
+        return json.dumps(content, indent=2)
+    return ""
 
-    mermaid_code, error = generate_attack_tree(label_or_prompt)
-    if error:
-        return JSONResponse(content={"error": error}, status_code=500)
-    return {"label": label_or_prompt, "mermaid": mermaid_code}
+def process_uploaded_file(file):
+    try:
+        content = read_file_content(file)
+        if not content:
+            return "❌ Could not extract content."
+        prompt = f"""Analyze the following content. If it includes prompts, generate attack trees using Mermaid.
+If it includes Mermaid attack tree code, explain the tree, recommend improvements, and suggest mitigations.
 
-# ========== Gradio UI ==========
+Content:
+{content}
+"""
+        system_msg = {
+            "role": "system",
+            "content": "You're a cybersecurity expert. If input is a prompt, return attack tree in Mermaid. If it's a tree, explain + mitigate."
+        }
+        response = client_ai.chat.completions.create(
+            model="gpt-4-turbo",
+            messages=[system_msg, {"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=1600
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        return f"❌ Error: {str(e)}"
 
-def gradio_generate(label):
-    code, err = generate_attack_tree(label)
-    return f"```mermaid\n{code}\n```" if code else f"❌ {err}"
+def ask_question_about_file(file, question):
+    try:
+        content = read_file_content(file)
+        if not content:
+            return "❌ Could not extract file content."
+        prompt = f"""Here is the content from a file:
+{content[:3000]}
 
+Now answer this question: {question}"""
+        response = client_ai.chat.completions.create(
+            model="gpt-4-turbo",
+            messages=[
+                {"role": "system", "content": "You are a cybersecurity assistant helping users understand and analyze file content."},
+                {"role": "user", "content": prompt}
+            ]
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        return f"❌ Error: {str(e)}"
+
+# ========================
+# Dropdown Utils
+# ========================
+def get_all_labels():
+    return sorted([doc["label"] for doc in prompt_library.find({}, {"label": 1})])
+
+def get_stored_labels():
+    return sorted(set([doc["label"] for doc in attack_tree_collection.find({"label": {"$exists": True}})]))
+
+def refresh_dropdowns():
+    return gr.update(choices=get_all_labels()), gr.update(choices=get_stored_labels())
+
+# ========================
+# 🌟 Gradio UI
+# ========================
 with gr.Blocks() as demo:
-    with gr.Tab("🌐 Web Interface"):
-        gr.Markdown("## 🔐 Threat Tree Generator")
-        label_input = gr.Textbox(label="Prompt or Label")
-        output = gr.Markdown()
-        gen_btn = gr.Button("🚀 Generate")
-        gen_btn.click(fn=gradio_generate, inputs=label_input, outputs=output)
+    with gr.Tab("🫠 Generate Attack Tree"):
+        label_dropdown = gr.Dropdown(choices=[], label="📌 Select or Type", interactive=True, allow_custom_value=True)
+        generate_button = gr.Button("🚀 Generate Attack Tree")
+        mermaid_display = gr.Markdown()
+        generate_button.click(fn=generate_attack_tree_from_label, inputs=label_dropdown, outputs=mermaid_display)
 
-@app.get("/")
-def root():
-    return {"message": "Threat Modeling API is running."}
+    with gr.Tab("📂 Library"):
+        saved_dropdown = gr.Dropdown(choices=[], label="📌 Select Stored Tree", interactive=True, allow_custom_value=True)
+        mermaid_output = gr.Markdown()
+        relation_table = gr.Dataframe(headers=["Surface Goal", "Attack Vector", "Technique", "Method", "Path"], datatype=["str"]*5, interactive=False)
+        download_button = gr.File()
+        regen_button = gr.Button("🔄 Regenerate Tree")
+        saved_dropdown.change(fn=wrapper_load, inputs=saved_dropdown, outputs=[mermaid_output, relation_table, download_button])
+        regen_button.click(fn=generate_attack_tree_from_label, inputs=saved_dropdown, outputs=mermaid_output)
 
-@app.get("/gradio")
-def launch_gradio():
-    return demo.launch(share=True, inline=True, prevent_thread_lock=True)
+    with gr.Tab("🗓️ Custom Prompt"):
+        prompt_input = gr.Textbox(label="Enter Custom Prompt", lines=5)
+        custom_mermaid_output = gr.Markdown()
+        submit_button = gr.Button("Generate Tree")
+        submit_button.click(fn=generate_tree_from_free_prompt, inputs=prompt_input, outputs=custom_mermaid_output)
 
-# ========== Run ==========
-if __name__ == "__main__":
-    uvicorn.run("app:app", host="0.0.0.0", port=7860, reload=True)
+    with gr.Tab("📄 Upload File"):
+        file_input = gr.File(file_types=[".pdf", ".csv", ".json"], label="Upload Prompt or Tree File")
+        file_output = gr.Markdown()
+        question_box = gr.Textbox(label="Ask a question about the file")
+        answer_box = gr.Markdown()
+        process_button = gr.Button("📈 Process File")
+        ask_button = gr.Button("🤔 Ask Question")
+        process_button.click(fn=process_uploaded_file, inputs=file_input, outputs=file_output)
+        ask_button.click(fn=ask_question_about_file, inputs=[file_input, question_box], outputs=answer_box)
+
+    demo.load(fn=refresh_dropdowns, inputs=[], outputs=[label_dropdown, saved_dropdown])
+
+# 🔗 Mount Gradio to FastAPI
+app = mount_gradio_app(app, demo, path="/")
+
