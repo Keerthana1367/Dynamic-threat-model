@@ -1,4 +1,3 @@
-# app.py
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from gradio.routes import mount_gradio_app
@@ -31,7 +30,7 @@ EXPORT_DIR = "csv_exports"
 os.makedirs(EXPORT_DIR, exist_ok=True)
 
 # ========================
-# ⚙️ FASTAPI SETUP
+# ⚙ FASTAPI SETUP
 # ========================
 app = FastAPI()
 
@@ -51,13 +50,6 @@ async def health_check():
     return {"status": "ok"}
 
 # ========================
-# ✅ ROOT ROUTE
-# ========================
-@app.get("/")
-async def root():
-    return {"message": "✅ Threat Tree App is running."}
-
-# ========================
 # 🌐 WEBHOOK ENDPOINT
 # ========================
 @app.post("/webhook")
@@ -67,7 +59,7 @@ async def receive_webhook(request: Request):
     return {"status": "✅ Webhook received", "received_data": payload}
 
 # ========================
-# 🛠️ Utility Functions
+# 🛠 Utility Functions
 # ========================
 
 def parse_mermaid_to_named_edges(mermaid_code):
@@ -111,8 +103,8 @@ def build_ordered_paths(edges):
     return paths
 
 def export_structured_csv(label, paths):
-    safe_label = label[:30].replace(' ', '_').replace('/', '_')
-    filename = f"{safe_label}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
+    safe_label = label[:30].replace(' ', '').replace('/', '')
+    filename = f"{safe_label}{datetime.utcnow().strftime('%Y%m%d%H%M%S')}.csv"
     filepath = os.path.join(EXPORT_DIR, filename)
     with open(filepath, mode='w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
@@ -146,7 +138,7 @@ def generate_attack_tree_from_label(label_selected):
     try:
         system_message = {
             "role": "system",
-            "content": "You are a cybersecurity expert. Return only the attack tree in Mermaid format using:\n```mermaid\ngraph TD\n...```"
+            "content": "You are a cybersecurity expert. Return only the attack tree in Mermaid format using:\nmermaid\ngraph TD\n..."
         }
         response = client_ai.chat.completions.create(
             model="gpt-4-turbo",
@@ -155,7 +147,7 @@ def generate_attack_tree_from_label(label_selected):
             max_tokens=1500
         )
         raw = response.choices[0].message.content.strip()
-        match = re.search(r"```mermaid\s*(graph TD[\s\S]*?)```", raw)
+        match = re.search(r"mermaid\s*(graph TD[\s\S]*?)", raw)
         if not match:
             return "❌ Mermaid diagram not found or invalid format."
         mermaid_code = match.group(1).strip()
@@ -168,7 +160,7 @@ def generate_attack_tree_from_label(label_selected):
             }},
             upsert=True
         )
-        return f"```mermaid\n{mermaid_code}\n```"
+        return f"mermaid\n{mermaid_code}\n"
     except Exception as e:
         return f"❌ Error: {str(e)}"
 
@@ -188,7 +180,7 @@ def wrapper_load(label):
     paths = build_ordered_paths(edges)
     csv_path = export_structured_csv(doc["label"], paths)
     df = read_csv_as_dataframe(csv_path)
-    return f"```mermaid\n{mermaid_code}\n```", df, csv_path
+    return f"mermaid\n{mermaid_code}\n", df, csv_path
 
 # ========================
 # Tab 3: Free Prompt
@@ -200,7 +192,7 @@ def generate_tree_from_free_prompt(prompt):
         base_prompt = prompt
         system_msg = {
             "role": "system",
-            "content": "You are a cybersecurity expert. Return the full updated attack tree in Mermaid format:\n```mermaid\ngraph TD\n...```"
+            "content": "You are a cybersecurity expert. Return the full updated attack tree in Mermaid format:\nmermaid\ngraph TD\n..."
         }
         response = client_ai.chat.completions.create(
             model="gpt-4-turbo",
@@ -209,11 +201,11 @@ def generate_tree_from_free_prompt(prompt):
             max_tokens=1500
         )
         raw = response.choices[0].message.content.strip()
-        match = re.search(r"```mermaid\s*(graph TD[\s\S]*?)```", raw)
+        match = re.search(r"mermaid\s*(graph TD[\s\S]*?)", raw)
         if not match:
             return "❌ Mermaid diagram not found or invalid format."
         mermaid_code = match.group(1).strip()
-        return f"```mermaid\n{mermaid_code}\n```"
+        return f"mermaid\n{mermaid_code}\n"
     except Exception as e:
         return f"❌ Error: {str(e)}"
 
@@ -315,7 +307,7 @@ with gr.Blocks() as demo:
         saved_dropdown.change(fn=wrapper_load, inputs=saved_dropdown, outputs=[mermaid_output, relation_table, download_button])
         regen_button.click(fn=generate_attack_tree_from_label, inputs=saved_dropdown, outputs=mermaid_output)
 
-    with gr.Tab("🗓️ Custom Prompt"):
+    with gr.Tab("🗓 Custom Prompt"):
         prompt_input = gr.Textbox(label="Enter Custom Prompt", lines=5)
         custom_mermaid_output = gr.Markdown()
         submit_button = gr.Button("Generate Tree")
@@ -333,7 +325,5 @@ with gr.Blocks() as demo:
 
     demo.load(fn=refresh_dropdowns, inputs=[], outputs=[label_dropdown, saved_dropdown])
 
-# 🔗 Mount Gradio to FastAPI
-gradio_app = gr.mount_gradio_app(app, gr_interface, path="/gradio")
-
-
+# 🔗 Mount Gradio to FastAPI (at root path)
+app = mount_gradio_app(app, demo, path="/")
