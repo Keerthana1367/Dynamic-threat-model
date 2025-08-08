@@ -334,5 +334,6 @@ with gr.Blocks() as demo:
     demo.load(fn=refresh_dropdowns, inputs=[], outputs=[label_dropdown, saved_dropdown])
 
 # 🔗 Mount Gradio to FastAPI
-app = mount_gradio_app(app, demo, path="/")
+gradio_app = gr.mount_gradio_app(app, gr_interface, path="/gradio")
+
 
