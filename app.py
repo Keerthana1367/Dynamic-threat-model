@@ -1,3 +1,4 @@
+# app.py
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from gradio.routes import mount_gradio_app
@@ -50,12 +51,18 @@ async def health_check():
     return {"status": "ok"}
 
 # ========================
+# ✅ ROOT ROUTE
+# ========================
+@app.get("/")
+async def root():
+    return {"message": "✅ Threat Tree App is running."}
+
+# ========================
 # 🌐 WEBHOOK ENDPOINT
 # ========================
 @app.post("/webhook")
 async def receive_webhook(request: Request):
     payload = await request.json()
-    # Optionally store this in MongoDB or handle logic
     return {"status": "✅ Webhook received", "received_data": payload}
 
 # ========================
@@ -325,5 +332,6 @@ with gr.Blocks() as demo:
 
     demo.load(fn=refresh_dropdowns, inputs=[], outputs=[label_dropdown, saved_dropdown])
 
-# 🔗 Mount Gradio to FastAPI (at root path)
+# ✅ FIXED: Use correct interface variable (demo)
 app = mount_gradio_app(app, demo, path="/")
+
