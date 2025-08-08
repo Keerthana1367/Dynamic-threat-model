@@ -1,5 +1,4 @@
 # app.py
-
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from gradio.routes import mount_gradio_app
@@ -8,10 +7,10 @@ import openai
 from openai import OpenAI
 from pymongo import MongoClient
 from datetime import datetime
-import re
-import csv
 import os
+import csv
 import json
+import re
 import pandas as pd
 from collections import defaultdict, deque
 from PyPDF2 import PdfReader
@@ -36,7 +35,7 @@ os.makedirs(EXPORT_DIR, exist_ok=True)
 # ========================
 app = FastAPI()
 
-# Allow all CORS (optional, based on your use case)
+# CORS (Allow all for simplicity; restrict in production)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -45,13 +44,26 @@ app.add_middleware(
 )
 
 # ========================
+# ✅ HEALTH CHECK (Render needs this!)
+# ========================
+@app.get("/health")
+async def health_check():
+    return {"status": "ok"}
+
+# ========================
+# ✅ ROOT ROUTE
+# ========================
+@app.get("/")
+async def root():
+    return {"message": "✅ Threat Tree App is running."}
+
+# ========================
 # 🌐 WEBHOOK ENDPOINT
 # ========================
 @app.post("/webhook")
 async def receive_webhook(request: Request):
     payload = await request.json()
-    print("📥 Webhook Received:", payload)
-    # 🔧 Optional: save to MongoDB or handle the payload
+    # Optionally store this in MongoDB or handle logic
     return {"status": "✅ Webhook received", "received_data": payload}
 
 # ========================
