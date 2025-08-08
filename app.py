@@ -3,7 +3,6 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from gradio.routes import mount_gradio_app
 import gradio as gr
-import openai
 from openai import OpenAI
 from pymongo import MongoClient
 from datetime import datetime
@@ -21,11 +20,15 @@ from PyPDF2 import PdfReader
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 MONGODB_URI = os.getenv("MONGODB_URI")
 
+# Initialize OpenAI client (match your installed SDK; this matches the pattern used previously)
 client_ai = OpenAI(api_key=OPENAI_API_KEY)
-mongo_client = MongoClient(MONGODB_URI)
-db = mongo_client["threat_db"]
-attack_tree_collection = db["attack_trees"]
-prompt_library = db["prompt_library"]
+
+# Mongo
+mongo_client = MongoClient(MONGODB_URI) if MONGODB_URI else None
+db = mongo_client["threat_db"] if mongo_client else None
+attack_tree_collection = db["attack_trees"] if db else None
+prompt_library = db["prompt_library"] if db else None
+webhook_events_collection = db["webhook_events"] if db else None
 
 EXPORT_DIR = "csv_exports"
 os.makedirs(EXPORT_DIR, exist_ok=True)
@@ -51,24 +54,30 @@ async def health_check():
     return {"status": "ok"}
 
 # ========================
-# ✅ ROOT ROUTE
-# ========================
-@app.get("/")
-async def root():
-    return {"message": "✅ Threat Tree App is running."}
-
-# ========================
-# 🌐 WEBHOOK ENDPOINT
+# 🌐 WEBHOOK ENDPOINT (Stores events)
 # ========================
 @app.post("/webhook")
 async def receive_webhook(request: Request):
-    payload = await request.json()
-    return {"status": "✅ Webhook received", "received_data": payload}
+    try:
+        payload = await request.json()
+    except Exception:
+        # if not JSON, attempt raw body
+        payload = (await request.body()).decode("utf-8", "ignore")
+
+    if webhook_events_collection:
+        webhook_events_collection.insert_one({
+            "data": payload,
+            "received_at": datetime.utcnow()
+        })
+
+    return {
+        "status": "✅ Webhook received and stored",
+        "received_data": payload
+    }
 
 # ========================
 # 🛠 Utility Functions
 # ========================
-
 def parse_mermaid_to_named_edges(mermaid_code):
     node_labels = {}
     edges = []
@@ -110,7 +119,7 @@ def build_ordered_paths(edges):
     return paths
 
 def export_structured_csv(label, paths):
-    safe_label = label[:30].replace(' ', '').replace('/', '')
+    safe_label = (label or "export")[:30].replace(' ', '').replace('/', '')
     filename = f"{safe_label}{datetime.utcnow().strftime('%Y%m%d%H%M%S')}.csv"
     filepath = os.path.join(EXPORT_DIR, filename)
     with open(filepath, mode='w', newline='', encoding='utf-8') as f:
@@ -126,7 +135,8 @@ def export_structured_csv(label, paths):
 def read_csv_as_dataframe(filepath):
     try:
         df = pd.read_csv(filepath)
-        df.drop_duplicates(subset=["Path"], inplace=True)
+        if "Path" in df.columns:
+            df.drop_duplicates(subset=["Path"], inplace=True)
         return df
     except Exception:
         return pd.DataFrame(columns=["Surface Goal", "Attack Vector", "Technique", "Method", "Path"])
@@ -137,16 +147,19 @@ def read_csv_as_dataframe(filepath):
 def generate_attack_tree_from_label(label_selected):
     if not label_selected:
         return "❌ Select a threat scenario."
-    doc = prompt_library.find_one({"label": label_selected}) or prompt_library.find_one({"aliases": {"$in": [label_selected.lower()]}})
+    doc = None
+    if prompt_library:
+        doc = prompt_library.find_one({"label": label_selected}) or prompt_library.find_one({"aliases": {"$in": [label_selected.lower()]}})
     if not doc or "prompt" not in doc:
         return f"❌ No prompt or alias found for '{label_selected}'"
     matched_prompt = doc["prompt"]
-    label_to_save = doc["label"]
+    label_to_save = doc.get("label", label_selected)
     try:
         system_message = {
             "role": "system",
             "content": "You are a cybersecurity expert. Return only the attack tree in Mermaid format using:\nmermaid\ngraph TD\n..."
         }
+        # Use the OpenAI client as per the SDK style in the original code
         response = client_ai.chat.completions.create(
             model="gpt-4-turbo",
             messages=[system_message, {"role": "user", "content": matched_prompt}],
@@ -154,19 +167,20 @@ def generate_attack_tree_from_label(label_selected):
             max_tokens=1500
         )
         raw = response.choices[0].message.content.strip()
-        match = re.search(r"mermaid\s*(graph TD[\s\S]*?)", raw)
+        match = re.search(r"mermaid\s*(graph TD[\s\S]*?)", raw, re.IGNORECASE)
         if not match:
             return "❌ Mermaid diagram not found or invalid format."
         mermaid_code = match.group(1).strip()
-        attack_tree_collection.update_one(
-            {"label": label_to_save},
-            {"$set": {
-                "prompt": matched_prompt,
-                "mermaid_code": mermaid_code,
-                "updated_at": datetime.utcnow()
-            }},
-            upsert=True
-        )
+        if attack_tree_collection:
+            attack_tree_collection.update_one(
+                {"label": label_to_save},
+                {"$set": {
+                    "prompt": matched_prompt,
+                    "mermaid_code": mermaid_code,
+                    "updated_at": datetime.utcnow()
+                }},
+                upsert=True
+            )
         return f"mermaid\n{mermaid_code}\n"
     except Exception as e:
         return f"❌ Error: {str(e)}"
@@ -177,7 +191,11 @@ def generate_attack_tree_from_label(label_selected):
 def wrapper_load(label):
     if not label:
         return "❌ Select a saved attack tree.", pd.DataFrame(), None
-    doc = attack_tree_collection.find_one({"label": label}) or prompt_library.find_one({"aliases": {"$in": [label.lower()]}})
+    doc = None
+    if attack_tree_collection:
+        doc = attack_tree_collection.find_one({"label": label})
+    if not doc and prompt_library:
+        doc = prompt_library.find_one({"aliases": {"$in": [label.lower()]}})
     if doc and "label" in doc and "mermaid_code" not in doc:
         return generate_attack_tree_from_label(doc["label"]), pd.DataFrame(), None
     if not doc or "mermaid_code" not in doc:
@@ -185,7 +203,7 @@ def wrapper_load(label):
     mermaid_code = doc["mermaid_code"]
     edges = parse_mermaid_to_named_edges(mermaid_code)
     paths = build_ordered_paths(edges)
-    csv_path = export_structured_csv(doc["label"], paths)
+    csv_path = export_structured_csv(doc.get("label", "export"), paths)
     df = read_csv_as_dataframe(csv_path)
     return f"mermaid\n{mermaid_code}\n", df, csv_path
 
@@ -193,22 +211,21 @@ def wrapper_load(label):
 # Tab 3: Free Prompt
 # ========================
 def generate_tree_from_free_prompt(prompt):
-    if not prompt.strip():
+    if not prompt or not prompt.strip():
         return "❌ Please enter a valid prompt"
     try:
-        base_prompt = prompt
         system_msg = {
             "role": "system",
             "content": "You are a cybersecurity expert. Return the full updated attack tree in Mermaid format:\nmermaid\ngraph TD\n..."
         }
         response = client_ai.chat.completions.create(
             model="gpt-4-turbo",
-            messages=[system_msg, {"role": "user", "content": base_prompt}],
+            messages=[system_msg, {"role": "user", "content": prompt}],
             temperature=0.3,
             max_tokens=1500
         )
         raw = response.choices[0].message.content.strip()
-        match = re.search(r"mermaid\s*(graph TD[\s\S]*?)", raw)
+        match = re.search(r"mermaid\s*(graph TD[\s\S]*?)", raw, re.IGNORECASE)
         if not match:
             return "❌ Mermaid diagram not found or invalid format."
         mermaid_code = match.group(1).strip()
@@ -221,21 +238,33 @@ def generate_tree_from_free_prompt(prompt):
 # ========================
 def extract_text_from_pdf(file):
     try:
-        reader = PdfReader(file)
+        reader = PdfReader(file.name if hasattr(file, "name") else file)
         return "".join([page.extract_text() or "" for page in reader.pages])
-    except:
+    except Exception:
         return ""
 
 def read_file_content(file):
-    ext = file.name.split('.')[-1].lower()
-    if ext == "pdf":
-        return extract_text_from_pdf(file)
-    elif ext == "csv":
-        df = pd.read_csv(file)
-        return df.to_string(index=False)
-    elif ext == "json":
-        content = json.load(file)
-        return json.dumps(content, indent=2)
+    if not file:
+        return ""
+    # Gradio file object often has .name which is the path
+    filename = getattr(file, "name", None)
+    ext = (filename.split('.')[-1].lower()) if filename else ""
+    try:
+        if ext == "pdf":
+            return extract_text_from_pdf(file)
+        elif ext == "csv":
+            df = pd.read_csv(file.name if filename else file)
+            return df.to_string(index=False)
+        elif ext == "json":
+            content = json.load(open(file.name if filename else file))
+            return json.dumps(content, indent=2)
+    except Exception:
+        # fallback: try reading raw bytes
+        try:
+            body = open(file.name, "r", encoding="utf-8").read()
+            return body
+        except Exception:
+            return ""
     return ""
 
 def process_uploaded_file(file):
@@ -284,16 +313,41 @@ Now answer this question: {question}"""
         return f"❌ Error: {str(e)}"
 
 # ========================
+# Webhook Viewer
+# ========================
+def load_webhook_events():
+    if not webhook_events_collection:
+        return pd.DataFrame(columns=["Received At", "Data"])
+    events = list(webhook_events_collection.find().sort("received_at", -1).limit(20))
+    table_data = []
+    for e in events:
+        received_at = e.get("received_at")
+        received_at_str = received_at.strftime("%Y-%m-%d %H:%M:%S") if received_at else ""
+        data_str = json.dumps(e.get("data"), indent=2) if not isinstance(e.get("data"), str) else e.get("data")
+        table_data.append([received_at_str, data_str])
+    return pd.DataFrame(table_data, columns=["Received At", "Data"])
+
+# ========================
 # Dropdown Utils
 # ========================
 def get_all_labels():
-    return sorted([doc["label"] for doc in prompt_library.find({}, {"label": 1})])
+    try:
+        if not prompt_library:
+            return []
+        return sorted([doc["label"] for doc in prompt_library.find({}, {"label": 1}) if "label" in doc])
+    except Exception:
+        return []
 
 def get_stored_labels():
-    return sorted(set([doc["label"] for doc in attack_tree_collection.find({"label": {"$exists": True}})]))
+    try:
+        if not attack_tree_collection:
+            return []
+        return sorted(set([doc["label"] for doc in attack_tree_collection.find({"label": {"$exists": True}}, {"label": 1}) if "label" in doc]))
+    except Exception:
+        return []
 
 def refresh_dropdowns():
-    return gr.update(choices=get_all_labels()), gr.update(choices=get_stored_labels())
+    return gr.update(choices=get_all_labels()), gr.update(choices=get_stored_labels()), load_webhook_events()
 
 # ========================
 # 🌟 Gradio UI
@@ -330,8 +384,11 @@ with gr.Blocks() as demo:
         process_button.click(fn=process_uploaded_file, inputs=file_input, outputs=file_output)
         ask_button.click(fn=ask_question_about_file, inputs=[file_input, question_box], outputs=answer_box)
 
-    demo.load(fn=refresh_dropdowns, inputs=[], outputs=[label_dropdown, saved_dropdown])
+    with gr.Tab("📡 Webhook Events"):
+        webhook_table = gr.Dataframe(headers=["Received At", "Data"], interactive=False)
 
-# ✅ FIXED: Use correct interface variable (demo)
+    # Load once on app start: update dropdowns and webhook table
+    demo.load(fn=refresh_dropdowns, inputs=[], outputs=[label_dropdown, saved_dropdown, webhook_table])
+
+# 🔗 Mount Gradio to FastAPI (at root path)
 app = mount_gradio_app(app, demo, path="/")
-
