@@ -11,9 +11,6 @@ from PyPDF2 import PdfReader
 from pymongo import MongoClient
 
 import gradio as gr
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from gradio.routes import mount_gradio_app
 
 # =====🔐 ENV VARS=====
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -254,8 +251,4 @@ with gr.Blocks() as demo:
 
     demo.load(fn=refresh_dropdowns, inputs=[], outputs=[label_dropdown, saved_dropdown])
 
-# =====🚀 FastAPI Wrapper=====
-app = FastAPI()
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-app = mount_gradio_app(app, demo, path="/")
-
+demo.launch()
